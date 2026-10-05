@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>NPRU EV Tracking</title>
+    
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <!-- Google Fonts (Kanit & Inter) -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Kanit:wght@300;400;500&display=swap" rel="stylesheet">
+    
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="style.css">
+
+    <!-- MQTT.js & Leaflet JS -->
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#f8fafc">
+</head>
+<body>
+
+    <div class="header-bar">
+        <div id="status-dot" class="status-dot"></div>
+        <div class="header-title">NPRU EV Tracking</div>
+    </div>
+
+    <div id="map"></div>
+
+    <!-- การ์ด Live Status -->
+    <div id="status-card" class="card">
+        <div class="drag-handle"></div>
+        <div class="card-header">
+            <div class="card-title">Live Status</div>
+            <button class="close-btn" onclick="toggleCard(false)">✕</button>
+        </div>
+        <div class="speed-display">
+            <span id="val-speed" class="speed-value">0.0</span>
+            <span class="speed-unit">km/h</span>
+        </div>
+        
+        <!-- UI แสดงป้ายถัดไปข้างหน้าและ ETA -->
+        <div class="data-item station-eta-box">
+            <span class="data-label station-eta-label">NEXT STATION (ETA)</span>
+            <span id="val-next-station" class="data-value station-eta-value">กำลังคำนวณ...</span>
+        </div>
+
+        <div class="data-grid">
+            <div class="data-item">
+                <span class="data-label">LATITUDE</span>
+                <span id="val-lat" class="data-value">--</span>
+            </div>
+            <div class="data-item">
+                <span class="data-label">LONGITUDE</span>
+                <span id="val-lon" class="data-value">--</span>
+            </div>
+            <div class="data-item full-width">
+                <span class="data-label">LAST UPDATED</span>
+                <span id="val-time" class="data-value">--:--:--</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function toggleCard(show) {
+            const card = document.getElementById('status-card');
+            if (show) {
+                card.classList.add('active');
+            } else {
+                card.classList.remove('active');
+            }
+        }
+
+        // 1. กำหนดพิกัดกรอบสี่เหลี่ยมครอบรอบ มรภ.นครปฐม
+        const npruBounds = L.latLngBounds(
+            [13.8280, 100.0180], // มุมซ้ายล่าง (South-West)
+            [13.8470, 100.0380]  // มุมขวาบน (North-East)
+        );
+
+        // 2. ตั้งค่าแผนที่ Leaflet พร้อมล็อกขอบเขต (maxBounds)
+        const map = L.map('map', { 
+            zoomControl: false,
+            maxBounds: npruBounds,
+            maxBoundsViscosity: 1.0, // ความหนืด 1.0 = ดึงอย่างไรก็ไม่หลุดขอบ
+            minZoom: 15,             // ซูมออกได้มากสุดแค่นี้
+            maxZoom: 19
+        }).setView([13.8375, 100.0275], 16.5);
+
+        L.control.zoom({ position: 'topright' }).addTo(map);
+
+        // Tile OpenStreetMap HOT
+        L.tileLayer('https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            subdomains: ['a', 'b', 'c'],
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, Tiles style by <a href="https://www.hotosm.org/">HOT</a>'
+        }).addTo(map);
+
+        // SVG Marker แบบแยกส่วนหุ้ม Wrapper ให้หมุนง่าย
+        const arrowIconSVG = `
+        <div id="arrow-wrapper" class="arrow-icon-wrapper">
+            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="filter: drop-shadow(0px 3px 6px rgba(0,0,0,0.3)); cursor: pointer;">
+                <path d="M12 2L4.5 20.29C4.15 21.15 5.12 21.96 5.9 21.54L12 18.25L18.1 21.54C18.88 21.96 19.85 21.15 19.5 20.29L12 2Z" fill="#0284c7" stroke="#ffffff" stroke-width="2" stroke-linejoin="round"/>
+            </svg>
+        </div>`;
+
+        const busIcon = L.divIcon({
+            html: arrowIconSVG,
+            className: 'custom-arrow-marker',
+            iconSize: [36, 36],
+            iconAnchor: [18, 18]
+        });
+
+        let vehicleMarker = null;
+        let lastLat = null;
+        let lastLon = null;
+        let lastApiLat = null;
+        let lastApiLon = null;
+        let lastHeading = 0; // เพิ่มตัวแปรจำทิศทางล่าสุด
+
+        // จุดจอดสำคัญ 8 จุด
+        const stationIcon = L.divIcon({
+            html: '<div class="station-dot"></div>',
+            className: 'station-marker',
+            iconSize: [18, 18],
+            iconAnchor: [9, 9]
+        });
+
+        const stations = [
+            { name: "🚏 ตึกโลจิสติกส์", lat: 13.838604, lon: 100.028466 },
+            { name: "🚏 ตึก A1", lat: 13.837123, lon: 100.029490 },
+            { name: "🚏 อาคารสิริวรปัญญา", lat: 13.835116, lon: 100.031744 },
+            { name: "🚏 อาคารทราวดีศรีราชภัฏ", lat: 13.836169, lon: 100.028266 },
+            { name: "🚏 ร้านพันธุ์ไทย", lat: 13.837253, lon: 100.026192 },
+            { name: "🚏 กองกิจการนักศึกษา", lat: 13.837557, lon: 100.025420 },
+            { name: "🚏 ตึกคอมพิวเตอร์", lat: 13.838072, lon: 100.025363 },
+            { name: "🚏 ศูนย์อนุบาลสาธิต", lat: 13.837439, lon: 100.026737 }
+        ];
+
+        stations.forEach(st => {
+            L.marker([st.lat, st.lon], { icon: stationIcon }).addTo(map).bindPopup(`<b>${st.name}</b>`);
+        });
+
+        // 1. ฟังก์ชันคำนวณระยะทางตรง (หน่วย: เมตร)
+        function getDistanceMeters(lat1, lon1, lat2, lon2) {
+            const R = 6371e3;
+            const rad1 = lat1 * Math.PI / 180;
+            const rad2 = lat2 * Math.PI / 180;
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+
+            const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                      Math.cos(rad1) * Math.cos(rad2) *
+                      Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        }
+
+        // 2. ฟังก์ชันคำนวณองศาทิศทาง (Heading Angle: 0 - 360 องศา)
+        function calculateBearing(startLat, startLng, destLat, destLng) {
+            const startLatRad = startLat * Math.PI / 180;
+            const startLngRad = startLng * Math.PI / 180;
+            const destLatRad = destLat * Math.PI / 180;
+            const destLngRad = destLng * Math.PI / 180;
+
+            const y = Math.sin(destLngRad - startLngRad) * Math.cos(destLatRad);
+            const x = Math.cos(startLatRad) * Math.sin(destLatRad) -
+                      Math.sin(startLatRad) * Math.cos(destLatRad) * Math.cos(destLngRad - startLngRad);
+
+            let brng = Math.atan2(y, x) * 180 / Math.PI;
+            return (brng + 360) % 360;
+        }
+
+        // 3. ฟังก์ชันหาป้ายถัดไปข้างหน้า + คำนวณ ETA
+        async function getDynamicNextStationETA(carLat, carLon, prevLat, prevLon, stations) {
+            if (!stations || stations.length === 0) return null;
+
+            for (let st of stations) {
+                const dist = getDistanceMeters(carLat, carLon, st.lat, st.lon);
+                if (dist <= 20) {
+                    return {
+                        stationName: st.name,
+                        statusText: "กำลังจอดรับ-ส่งที่สถานีนี้"
+                    };
+                }
+            }
+
+            let candidateStations = [...stations];
+
+            if (prevLat !== null && prevLon !== null && (prevLat !== carLat || prevLon !== carLon)) {
+                const carHeading = calculateBearing(prevLat, prevLon, carLat, carLon);
+
+                candidateStations = stations.filter(st => {
+                    const headingToStation = calculateBearing(carLat, carLon, st.lat, st.lon);
+                    let angleDiff = Math.abs(carHeading - headingToStation);
+                    if (angleDiff > 180) angleDiff = 360 - angleDiff;
+                    return angleDiff <= 85; 
+                });
+            }
+
+            if (candidateStations.length === 0) {
+                candidateStations = [...stations];
+            }
+
+            const coordinates = [`${carLon},${carLat}`];
+            candidateStations.forEach(st => coordinates.push(`${st.lon},${st.lat}`));
+            
+            const url = `https://router.project-osrm.org/table/v1/driving/${coordinates.join(';')}?sources=0`;
+
+            try {
+                const response = await fetch(url);
+                const data = await response.json();
+
+                if (data.code === 'Ok' && data.durations && data.durations[0]) {
+                    const travelTimes = data.durations[0]; 
+                    let minTimeSeconds = Infinity;
+                    let nearestIndex = -1;
+
+                    for (let i = 1; i < travelTimes.length; i++) {
+                        if (travelTimes[i] !== null && travelTimes[i] < minTimeSeconds) {
+                            minTimeSeconds = travelTimes[i];
+                            nearestIndex = i - 1;
+                        }
+                    }
+
+                    if (nearestIndex !== -1) {
+                        const targetStation = candidateStations[nearestIndex];
+                        const minutes = Math.ceil(minTimeSeconds / 60);
+
+                        return {
+                            stationName: targetStation.name,
+                            statusText: minutes <= 1 ? "กำลังจะถึงในไม่ช้า" : `อีกประมาณ ${minutes} นาที`
+                        };
+                    }
+                }
+            } catch (e) {
+                console.warn("OSRM Table Error:", e);
+            }
+
+            return null;
+        }
+
+        // Snap to Road
+        async function snapToRoad(lat, lon) {
+            try {
+                const response = await fetch(`https://router.project-osrm.org/nearest/v1/driving/${lon},${lat}`);
+                const data = await response.json();
+                if (data.code === 'Ok' && data.waypoints.length > 0) {
+                    const snappedLocation = data.waypoints[0].location;
+                    return { lat: snappedLocation[1], lon: snappedLocation[0] };
+                }
+            } catch (e) {
+                console.warn("Snap to road error:", e);
+            }
+            return { lat, lon };
+        }
+
+        // เชื่อมต่อ HiveMQ Cloud
+        const host = '772cedfd53934e2190d8c30958766728.s1.eu.hivemq.cloud';
+        const port = 8884;
+        const topic = 'npru/ev/bus01';
+
+        const client = mqtt.connect(`wss://${host}:${port}/mqtt`, {
+            username: 'bus01',
+            password: '12345678',
+            clientId: 'web_client_' + Math.random().toString(16).substr(2, 8)
+        });
+
+        const statusDot = document.getElementById('status-dot');
+
+        client.on('connect', () => {
+            statusDot.classList.add('online');
+            client.subscribe(topic);
+        });
+
+        client.on('offline', () => {
+            statusDot.classList.remove('online');
+        });
+
+        // รับข้อมูลและอัปเดตตำแหน่ง
+        client.on('message', async (topic, message) => {
+            try {
+                const data = JSON.parse(message.toString());
+                const rawLat = data.lat;
+                const rawLon = data.lon;
+                const speed = data.speed || 0.0;
+                const timeStr = data.updatedAt || '--:--:--';
+
+                let lat = rawLat;
+                let lon = rawLon;
+
+                if (!lastApiLat || getDistanceMeters(rawLat, rawLon, lastApiLat, lastApiLon) > 5) {
+                    const snapped = await snapToRoad(rawLat, rawLon);
+                    lat = snapped.lat;
+                    lon = snapped.lon;
+                    lastApiLat = lat;
+                    lastApiLon = lon;
+                }
+
+                document.getElementById('val-lat').innerText = lat.toFixed(5);
+                document.getElementById('val-lon').innerText = lon.toFixed(5);
+                document.getElementById('val-speed').innerText = speed.toFixed(1);
+                document.getElementById('val-time').innerText = timeStr;
+
+                // คำนวณ ETA
+                const etaInfo = await getDynamicNextStationETA(lat, lon, lastLat, lastLon, stations);
+                if (etaInfo) {
+                    document.getElementById('val-next-station').innerText = 
+                        `${etaInfo.stationName} (${etaInfo.statusText})`;
+                } else {
+                    document.getElementById('val-next-station').innerText = "กำลังคำนวณ...";
+                }
+
+                // กรองทิศทาง (Heading Filter) ป้องกันหมุดแกว่ง
+                let currentHeading = lastHeading;
+                if (lastLat !== null && lastLon !== null) {
+                    const distMoved = getDistanceMeters(lastLat, lastLon, lat, lon);
+                    // คำนวณทิศทางใหม่เมื่อขยับเกิน 2.5 เมตร และความเร็วมากกว่า 3 km/h
+                    if (distMoved >= 2.5 && speed > 3.0) {
+                        currentHeading = calculateBearing(lastLat, lastLon, lat, lon);
+                        lastHeading = currentHeading;
+                    }
+                }
+
+                if (!vehicleMarker) {
+                    vehicleMarker = L.marker([lat, lon], { icon: busIcon }).addTo(map);
+                    vehicleMarker.on('click', () => toggleCard(true));
+                    map.panTo([lat, lon]);
+                } else {
+                    vehicleMarker.setLatLng([lat, lon]);
+                    map.panTo([lat, lon]);
+
+                    const wrapper = document.getElementById('arrow-wrapper');
+                    if (wrapper) {
+                        wrapper.style.transform = `rotate(${currentHeading}deg)`;
+                    }
+                }
+
+                if (lastLat === null || getDistanceMeters(lastLat, lastLon, lat, lon) >= 1.0) {
+                    lastLat = lat;
+                    lastLon = lon;
+                }
+
+            } catch (e) {
+                console.error("Error processing message:", e);
+            }
+        });
+
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./sw.js')
+                    .then(reg => console.log('SW Registered!', reg))
+                    .catch(err => console.log('SW Register Failed!', err));
+            });
+        }
+    </script>
+</body>
+</html>
